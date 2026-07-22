@@ -1,0 +1,55 @@
+name: redpanda-trades
+networks:
+  redpanda_network:
+    driver: bridge
+volumes:
+  redpanda-0: null
+services:
+  ##################
+  # Redpanda Broker #
+  ##################
+  redpanda-0:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
+    container_name: redpanda-0
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      # internal: how other containers on redpanda_network reach this broker (e.g. a future consumer container)
+      # external: how your producer script, running on the host machine, reaches it
+      - --advertise-kafka-addr internal://redpanda-0:9092,external://localhost:19092
+      # dev-container mode: sane defaults for a single-node container, not a production cluster
+      - --mode dev-container
+      # 1 CPU core is plenty for a laptop dev setup; Redpanda is thread-per-core underneath
+      - --smp 1
+      - --default-log-level=info
+    volumes:
+      - redpanda-0:/var/lib/redpanda/data
+    networks:
+      - redpanda_network
+    ports:
+      - 19092:19092
+      - 19644:9644
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info"]
+      interval: 10s
+      timeout: 15s
+      retries: 10
+  #############################################################
+  # rpk container to create the trades topic with 3 partitions #
+  # See https://docs.redpanda.com/current/reference/rpk/rpk-topic/rpk-topic-create/
+  #############################################################
+  createtopic:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
+    command:
+      - topic
+      - create
+      - trades
+      - --partitions
+      - "3"
+      - -X brokers=redpanda-0:9092
+    networks:
+      - redpanda_network
+    depends_on:
+      redpanda-0:
+        condition: service_healthy
