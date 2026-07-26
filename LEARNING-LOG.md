@@ -36,8 +36,8 @@ Streaming concepts → connect to feed → Kafka/Redpanda → run the broker →
 | 2 | Connect to live feed, print trades | BUILD | ✅ Done |
 | 3 | Kafka / Redpanda concepts | LEARN | ✅ Done (folded into Task 4, no standalone checkpoint) |
 | 4 | Run the broker, produce to a topic | BUILD | ✅ Done |
-| 5 | Storage formats: Parquet & Iceberg | LEARN | ⬜ Locked |
-| 6 | Write to S3 bronze | BUILD | ⬜ Locked |
+| 5 | Storage formats: Parquet & Iceberg | LEARN | ✅ Done (folded into Task 6; 3 reasoning Qs posed, not yet answered verbally — see notes) |
+| 6 | Write to S3 bronze | BUILD | 🔨 Core build done, targeting local disk (offline-friendly); crash/dedup test + real S3 swap still open |
 | 7 | Wire end-to-end | BUILD | ⬜ Locked |
 
 ---
@@ -226,6 +226,76 @@ Asked whether AWS (MSK or self-managed EC2) should host the broker now instead o
 
 ---
 
+## Task 5+6 — Storage formats (Parquet & Iceberg) + Kafka consumer writing to local Iceberg bronze (LEARN + BUILD) 🔨
+
+**Why folded together:** same format change as Task 3+4 — concepts explained inline against the real build rather than as standalone reading.
+
+### Concepts covered (Task 5)
+
+**Why not raw JSON as the storage format:**
+- **Columnar pruning.** Parquet stores each column contiguously on disk; a query needing `avg(price) by product_id` reads only those two columns' bytes. JSON interleaves every field per record, so extracting even one field means parsing the whole object, every record.
+- **Type safety.** `price`/`size` arrive as JSON strings (`"64728.45"`). JSON enforces no type — every downstream reader has to independently cast, with no shared contract and no guaranteed consistency across tools. Parquet bakes the type in once, at write time.
+- **Small-files problem, in concrete numbers.** At the ~5 msg/sec measured in Task 2, one JSON file per trade would mean `5 × 3600 ≈ 18,000` files/hour, ~432,000/day — first pass at this arithmetic used division instead of multiplication and had to be corrected.
+
+**Why Iceberg on top of Parquet — three reasoning scenarios, revisited after being skipped the first time:**
+
+1. **Schema change.** *My answer: didn't know.* A naive "read every Parquet file under this prefix" approach breaks because each Parquet file is self-describing (its own schema in the file footer) but nothing ties them into one coherent table schema across files — mismatched files either error out, or (Spark with schema-merging) require reading every file's footer to reconcile, and a rename is indistinguishable from "column vanished, unrelated column appeared." **Iceberg's fix:** every column has a permanent **field ID** (see interview flag #17), tracked centrally in versioned table metadata. Add a column → new schema version, old files are known to be missing that field ID, readers return null for it. Rename → same field ID, relabeled, old data untouched. The engine asks the catalog for the current schema once, instead of inferring it file-by-file.
+
+2. **Partition pruning.** *My answer: didn't know.* Without a table format, "know which files to look at" means calling S3's LIST API to walk the folder structure before reading any actual data — at scale, thousands of LIST calls per query, each a real network round trip and API cost, paid every time regardless of query selectivity. **Iceberg's fix:** a compact metadata layer (manifest files) records exactly which data files belong to which partition values, plus per-file min/max column stats, so the engine reads a handful of small manifest files instead of listing S3 — and can skip files *within* a matching partition too, using the stats. This is the literal mechanism behind `CLAUDE.md`'s "cost control (Iceberg partition pruning)" line.
+
+3. **Crash mid-write.** Instead of answering in the abstract, decided to test it empirically once the consumer existed — see the crash-test plan in Task 6's open items below.
+
+⚠️ Both explanations above were given directly rather than derived independently — logged honestly per this journal's own rule (record what I got wrong or didn't know, not a cleaned-up version). Worth being able to re-derive/explain 1 and 2 unprompted before an interview, not just recognize them read back.
+
+### Offline prep (this build happened around a 2-hour flight with no connectivity)
+
+- Installed `pyiceberg[pyarrow,sql-sqlite]` while still online — pure Python, no JVM, and supports a fully local catalog (SQLite metadata DB + local `file://` warehouse dir), so the real Task 6 logic could be built and tested with zero network access, then repointed at S3 later.
+- Verified the local catalog pattern with a throwaway smoke test (create table, write rows, read back) before losing connectivity — worked, then deleted as scratch.
+- Saved `pyiceberg` and `confluent-kafka` Consumer API references, plus a self-contained task brief, to `docs/reference/` — necessary because **I (the assistant) am cloud-based and equally unreachable without internet**, not just the AWS parts of the pipeline. Deleted by choice once back online in favor of the live official docs.
+
+### Requirements / decisions made (Task 6, offline-friendly variant — local disk instead of S3 for now)
+
+Build `consumer/trades_to_bronze.py`:
+1. `confluent_kafka.Consumer` reads `trades`, batches messages (not one Iceberg write per message — same small-files reasoning as above, just one layer down).
+2. Batch cast to match an explicit Iceberg schema, then appended to a local Iceberg table.
+3. Kafka offset committed **only after** a successful Iceberg append — at-least-once, matching the Task 1 plan.
+
+**Schema decisions:** `price`/`size` as `DecimalType(18, 8)` — chosen over `DoubleType` specifically to avoid float rounding on money, direct continuation of Task 5's type-safety point. `trade_id`/`sequence` as `LongType` (64-bit) — real observed values like `sequence: 132876007876` exceed a 32-bit int's ~2.1B ceiling. `time` as `TimestampType`. Everything else `StringType`.
+
+**Partitioning:** `PartitionSpec` with **both** a `DayTransform()` on `time` and an `IdentityTransform()` on `product_id` — queries will filter by date range and likely by product, so both get pruning.
+
+### Definition of done
+
+- [x] Consumer reads `trades`, batches, casts types, writes to a local Iceberg `bronze.trades` table
+- [x] Offset committed only after a successful append
+- [x] Verified with real data: 1,400 rows landed with correct types (`decimal128(18,8)`, `timestamp[us]`, `int64`), confirmed via a direct PyArrow scan, not just "no errors"
+- [x] Runs correctly regardless of working directory (tested from two different launch locations)
+- [ ] Crash-mid-batch duplicate test (kill after append, before commit, restart, confirm a duplicate `trade_id`) — reasoned through, **not yet actually run**
+- [ ] Task 5's three Iceberg-justification questions answered explicitly in words
+- [ ] Real S3 target (currently local disk only)
+
+### Notes from the build — bugs found, roughly in the order hit
+
+1. **`poll()` and `consume()` called together in the same loop iteration** — redundant, not a real pattern. Settled on `consume(num_messages, timeout)` alone. Correction along the way: initial understanding of `poll(timeout=...)` as "checks every X seconds" was imprecise — it's a single call that blocks *up to* X seconds and returns as soon as one message is available, not a fixed interval. Also: `consume()` has no default timeout and can block indefinitely if one isn't passed.
+2. **`consume()`'s empty-batch signal is `[]`, not `None`** (different from `poll()`) — and errors can appear as individual entries mixed into the returned list, requiring a per-item `.error()` check rather than one check per call.
+3. **`listItem.value` missing `()`** — printed the bound method object instead of the actual bytes. Fixed to `.value().decode()` + `json.loads()`.
+4. **Duplicate `field_id=1`** on two different `NestedField`s (`type` and `trade_id`). Iceberg field IDs are the stable identity of a column across schema evolution — not the name or position — and must be unique. Renumbered 1–10.
+5. **`DecimalType(precision=2)` missing the required `scale` argument** — would crash at `Schema()` construction (module-level code, so at import time, before the script even starts). Fixed to `DecimalType(precision=18, scale=8)`, sized against actually-observed price/size ranges, not guessed.
+6. **`batch.append()` called with no argument** — real `TypeError` the moment a message arrived; the parsed value was computed and silently discarded. Regressed at the same time: the per-message print disappeared too. Both restored.
+7. **Catalog config pointed at infrastructure that didn't exist** — a `type="rest"` catalog at `http://localhost:8181` (nothing running there) and a placeholder bucket `s3://my-iceberg-warehouse/data`, both copied from official docs examples rather than the working local-`SqlCatalog` pattern already proven in the smoke test. Real friction here: the smoke-test code itself had already been deleted after running it, so "same as the smoke test" wasn't something to actually reference — had to be given the concrete snippet directly instead of pointed at something no longer inspectable. ⚠️ Lesson for how this log-keeper (me) should operate: don't gesture at deleted/unreachable prior work as if it's a sufficient pointer.
+8. **Namespace/table named `analytics`/`user_events`** — also copy-pasted from a generic docs example, unrelated to this project. Renamed to `bronze`/`trades`.
+9. **`create_table` instead of `create_table_if_not_exists`** — would raise `TableAlreadyExistsError` on every restart after the first. Separately, `create_namespace_if_not_exists` was called with `schema=`/`partition_spec=` kwargs it doesn't accept — those belong to table creation, not namespace creation (a namespace is just an organizational container, nothing else). Split into two correct calls.
+10. **Type casting at the Kafka→Iceberg boundary:** `price`/`size` cast via `Decimal(string)` directly — explicitly *not* through `float()` first, since a float has already lost the precision `DecimalType` exists to preserve. `time` needed its trailing `"Z"` swapped for `"+00:00"` before `datetime.fromisoformat()` — **Python 3.9** (this project's actual interpreter) doesn't parse a trailing `Z`; that support only arrived in Python 3.11.
+11. **`table.schema().as_arrow()`** used to derive the PyArrow schema for `pa.Table.from_pylist()`, instead of hand-declaring a second schema that could silently drift from the Iceberg one — one source of truth.
+12. **SQLite `unable to open database file`** — the catalog's `uri`/`warehouse` paths were relative to whatever directory the script happened to be launched from, not the project root. Fixed by anchoring both to the script's own file location (`os.path.dirname(os.path.abspath(__file__))`), so it's invocation-directory-independent. Verified by actually running it from a different working directory, not just reasoning about it.
+13. **`trades` topic silently regressed from 3 partitions to 1** at some point after Task 4. Root cause confirmed via the `createtopic` helper container's own logs: `TOPIC_ALREADY_EXISTS`, three times. `depends_on: condition: service_healthy` in `docker-compose.yml` only orders containers *within that compose file* — it has no coordination power over an externally-launched host process (the producer script). On a stack restart, the producer almost certainly connected first and Redpanda auto-created `trades` with the default 1 partition before the dedicated `createtopic` container's explicit `--partitions 3` got to run. Fixed by deleting and recreating the topic — this dropped 153 backlog messages still unconsumed in Kafka (fine, dev-only) but did **not** affect the 1,400 rows already durably written to the Iceberg table, since those two are independent once written.
+
+### My questions
+
+No formal clarification questions distinct from the bug narrative above. One real process moment worth recording: pushed back hard when told to fix a catalog config "the same shape as the smoke test" — the smoke test code had already been deleted, so that wasn't an actionable pointer, only a source of frustration. Landed on: for mechanical/infrastructure details (exact API shapes, config values), give the concrete answer directly rather than gesturing at something not actually inspectable — reserve the "figure it out yourself" approach for genuine design/reasoning decisions, not API trivia.
+
+---
+
 ## Running list of interview flags
 
 | # | Flag | Source |
@@ -243,6 +313,11 @@ Asked whether AWS (MSK or self-managed EC2) should host the broker now instead o
 | 11 | Kafka and Redpanda share a wire protocol; the difference is the runtime (JVM+ZooKeeper vs. single C++ binary) — be ready to state this plainly rather than downplay it | Task 3+4 |
 | 12 | A blocking call (`flush()`) inside an async loop stalls the event loop the same way a slow synchronous write would — same failure category, different disguise | Task 3+4 |
 | 13 | Code placed right after a call is not "after" it if that call is the thing that raises/interrupts — check what actually happens on the exception path, not just the happy path | Task 3+4 |
+| 14 | Docker Compose's `depends_on: condition: service_healthy` only orders containers *within the same compose file* — it can't coordinate with an externally-launched host process, which can race ahead and silently change infrastructure state (e.g. auto-creating a topic with default settings before an explicit create step runs) | Task 5+6 |
+| 15 | Python 3.9's `datetime.fromisoformat()` doesn't parse a trailing `Z` — that support only arrived in Python 3.11. Know your actual interpreter's behavior, don't assume uniform ISO 8601 support | Task 5+6 |
+| 16 | Convert `Decimal` from the original string, never through `float()` first — float has already lost the precision `Decimal`/`DecimalType` exist to preserve | Task 5+6 |
+| 17 | Iceberg field IDs are a column's stable identity across schema evolution (not name or position) and must be unique within a schema — this is *why* renaming a column doesn't break downstream readers | Task 5+6 |
+| 18 | Anchor file/config paths to the script's own location (`os.path.abspath(__file__)`), not the current working directory, for anything that must work regardless of how/where it's invoked | Task 5+6 |
 
 ---
 

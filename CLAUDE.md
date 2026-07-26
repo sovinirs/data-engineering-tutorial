@@ -49,8 +49,10 @@ A standing rule that applies to this project, the README, and my resume: **defen
 - **Task 2 (connect to the live feed, print trades): complete.**
 - **Task 3 (Kafka/Redpanda concepts): complete**, folded into Task 4 per the rule 2 format change.
 - **Task 4 (run the broker, produce to a topic): complete.** Redpanda running locally in Docker (`docker-compose/`), `trades` topic with 3 partitions, producer keyed by `product_id` using `confluent-kafka`.
+- **Task 5 (Parquet/Iceberg concepts): folded into Task 6.** Three reasoning questions (schema change, partition pruning, crash-mid-write) posed but not yet answered verbally — revisit before considering this fully closed.
+- **Task 6 (write to S3 bronze): core build complete, targeting local disk, not S3 yet.** `consumer/trades_to_bronze.py` reads `trades`, batches, casts types, writes to a local Iceberg `bronze.trades` table (local `SqlCatalog`, `warehouse/` dir), commits offsets only after a successful append. Verified with 1,400 real rows, correct types, runs from any working directory. Still open: crash-mid-batch duplicate test, and swapping the local catalog for real S3.
 
-See @docs/LEARNING-LOG.md for the full history, the corrections so far, and Task 4's definition of done.
+See @docs/LEARNING-LOG.md for the full history, the corrections so far, and Task 6's definition of done.
 
 ## Stack context about me
 
